@@ -1,0 +1,48 @@
+# 环境配置
+conda create -n gofundme python=3.10 -y
+source activate gofundme
+pip install pandas requests
+pip install selenium
+pip install pyperclip
+pip install opencv-python
+pip install mediapipe==0.10.9
+sudo apt-get update
+sudo apt-get install xclip
+
+# db_init.py创建数据表，开始运行1次
+# python db_init.py
+# collector.py扫描category页面，爬取项目链接，可增量爬取，每次增大MAX_PROJECTS
+# scraper.py根据项目链接，打开每个项目页面，爬取页面文本，下载封面图
+python collector.py
+python scraper.py
+# parser.py解析页面文本，获取有效字段
+# resizer.py缩小封面图，并转为jpg格式
+# detector.py检测封面图中人脸数
+# exporter.py导出Exce1表
+# 下面4个程序可最后运行1次
+python parser.py
+python resizer.py
+python detector.py
+python exporter.py
+
+# 数据库相关命令
+sqlite3 gofundme.db
+
+# 删除表中所有数据
+DELETE FROM projects;
+DELETE FROM campaigns;
+
+.tables
+
+SELECT * FROM projects;
+SELECT * FROM projects LIMIT 1;
+
+SELECT * FROM campaigns;
+SELECT * FROM campaigns LIMIT 1;
+
+UPDATE projects SET content = NULL;
+
+# 删除表
+DROP TABLE projects;
+DROP TABLE campaigns;
+
