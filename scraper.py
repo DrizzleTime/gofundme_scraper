@@ -1,7 +1,9 @@
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime
+from html import unescape
 from urllib.parse import urlparse
 
 import requests
@@ -192,6 +194,22 @@ def count_recent_donations(fundraiser):
     return len(edges)
 
 
+def html_to_text(html_text):
+    if html_text is None:
+        return None
+
+    text = re.sub(r"(?i)<br\s*/?>", "\n", html_text)
+    text = re.sub(r"(?i)</(div|p|li|h[1-6])\s*>", "\n", text)
+    text = re.sub(r"(?i)<li\s*>", "- ", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text).replace("\xa0", " ")
+    text = text.replace("\r", "")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def pick_image_url(fundraiser):
     fundraiser_photo = fundraiser.get("fundraiserPhoto") or {}
     return fundraiser_photo.get("url") or fundraiser.get("fundraiserImageUrl")
@@ -217,7 +235,7 @@ def download_image(session, image_url, project_id, scrape_time):
     return image_name
 
 
-def insert_campaign(cursor, project_id, category, fundraiser):
+def insert_campaign(cursor, project_id, category, fundraiser, description_text):
     cursor.execute(
         """
         INSERT INTO campaigns (
@@ -250,12 +268,12 @@ def insert_campaign(cursor, project_id, category, fundraiser):
             money_amount_text(fundraiser.get("currentAmount")),
             stringify_number(fundraiser.get("donationCount")),
             stringify_number(fundraiser.get("updateCount")),
-            fundraiser.get("description"),
+            description_text,
         ),
     )
 
 
-def update_campaign(cursor, project_id, category, fundraiser):
+def update_campaign(cursor, project_id, category, fundraiser, description_text):
     cursor.execute(
         """
         UPDATE campaigns
@@ -286,7 +304,7 @@ def update_campaign(cursor, project_id, category, fundraiser):
             money_amount_text(fundraiser.get("currentAmount")),
             stringify_number(fundraiser.get("donationCount")),
             stringify_number(fundraiser.get("updateCount")),
-            fundraiser.get("description"),
+            description_text,
             project_id,
         ),
     )
@@ -337,12 +355,25 @@ def main():
 
             try:
                 fundraiser = fetch_fundraiser(session, slug)
+                description_text = html_to_text(fundraiser.get("description"))
 
                 if campaign_id is None:
-                    insert_campaign(cursor, project_id, category, fundraiser)
+                    insert_campaign(
+                        cursor,
+                        project_id,
+                        category,
+                        fundraiser,
+                        description_text,
+                    )
                     inserted_campaigns += 1
                 else:
-                    update_campaign(cursor, project_id, category, fundraiser)
+                    update_campaign(
+                        cursor,
+                        project_id,
+                        category,
+                        fundraiser,
+                        description_text,
+                    )
                     updated_campaigns += 1
 
                 current_image_name = image_name
@@ -367,7 +398,7 @@ def main():
                     cursor,
                     project_id,
                     current_image_name,
-                    fundraiser.get("description"),
+                    description_text,
                     scrape_time,
                 )
 
