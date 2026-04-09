@@ -3,7 +3,7 @@ import sqlite3
 import time
 from urllib.parse import quote, urlencode
 
-import requests
+import httpx
 
 DB_NAME = "gofundme.db"
 CATEGORY = "medical"
@@ -121,7 +121,7 @@ def build_params(page, window_start, window_end):
     return urlencode(params, quote_via=quote)
 
 
-def fetch_page(session, page, window_start, window_end):
+def fetch_page(client, page, window_start, window_end):
     payload = {
         "requests": [
             {
@@ -131,7 +131,7 @@ def fetch_page(session, page, window_start, window_end):
         ]
     }
 
-    response = session.post(
+    response = client.post(
         ALGOLIA_URL,
         headers=HEADERS,
         data=json.dumps(payload, separators=(",", ":")),
@@ -188,7 +188,6 @@ def should_split(result, window_start, window_end):
 
 
 def main():
-    session = requests.Session()
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
@@ -199,7 +198,6 @@ def main():
     if existing_count >= TARGET_PROJECTS:
         print(f"{CATEGORY} 已有 {existing_count} 条，无需继续抓取")
         conn.close()
-        session.close()
         return
 
     current_count = existing_count
@@ -210,75 +208,75 @@ def main():
     windows = [(initial_start, initial_end)]
 
     try:
-        while windows and current_count < TARGET_PROJECTS:
-            window_start, window_end = windows.pop()
-            result = fetch_page(session, 0, window_start, window_end)
-            hits = result.get("hits", [])
+        with httpx.Client(follow_redirects=True) as client:
+            while windows and current_count < TARGET_PROJECTS:
+                window_start, window_end = windows.pop()
+                result = fetch_page(client, 0, window_start, window_end)
+                hits = result.get("hits", [])
 
-            if not hits:
-                continue
-
-            if should_split(result, window_start, window_end):
-                split_result = split_window(window_start, window_end)
-
-                if split_result is not None:
-                    older_window, newer_window = split_result
-                    windows.append(older_window)
-                    windows.append(newer_window)
-                    print(
-                        f"拆分窗口 {window_start}-{window_end}，"
-                        f"约 {result.get('nbHits', 0)} 条"
-                    )
-                    time.sleep(REQUEST_INTERVAL)
+                if not hits:
                     continue
 
+                if should_split(result, window_start, window_end):
+                    split_result = split_window(window_start, window_end)
+
+                    if split_result is not None:
+                        older_window, newer_window = split_result
+                        windows.append(older_window)
+                        windows.append(newer_window)
+                        print(
+                            f"拆分窗口 {window_start}-{window_end}，"
+                            f"约 {result.get('nbHits', 0)} 条"
+                        )
+                        time.sleep(REQUEST_INTERVAL)
+                        continue
+
+                    print(
+                        f"窗口 {window_start}-{window_end} 无法继续拆分，"
+                        "直接抓取当前可访问结果"
+                    )
+
+                total_pages = result.get("nbPages", 0)
                 print(
-                    f"窗口 {window_start}-{window_end} 无法继续拆分，"
-                    "直接抓取当前可访问结果"
+                    f"抓取窗口 {window_start}-{window_end}，"
+                    f"约 {result.get('nbHits', 0)} 条，{total_pages} 页"
                 )
 
-            total_pages = result.get("nbPages", 0)
-            print(
-                f"抓取窗口 {window_start}-{window_end}，"
-                f"约 {result.get('nbHits', 0)} 条，{total_pages} 页"
-            )
+                for page in range(total_pages):
+                    if current_count >= TARGET_PROJECTS:
+                        break
 
-            for page in range(total_pages):
-                if current_count >= TARGET_PROJECTS:
-                    break
+                    page_result = result if page == 0 else fetch_page(
+                        client,
+                        page,
+                        window_start,
+                        window_end,
+                    )
+                    page_hits = page_result.get("hits", [])
 
-                page_result = result if page == 0 else fetch_page(
-                    session,
-                    page,
-                    window_start,
-                    window_end,
-                )
-                page_hits = page_result.get("hits", [])
+                    if not page_hits:
+                        break
 
-                if not page_hits:
-                    break
+                    remaining_needed = TARGET_PROJECTS - current_count
+                    inserted, skipped = save_projects(cursor, page_hits, remaining_needed)
+                    conn.commit()
 
-                remaining_needed = TARGET_PROJECTS - current_count
-                inserted, skipped = save_projects(cursor, page_hits, remaining_needed)
-                conn.commit()
+                    current_count += inserted
+                    total_inserted += inserted
+                    total_skipped += skipped
 
-                current_count += inserted
-                total_inserted += inserted
-                total_skipped += skipped
+                    print(
+                        f"窗口 {window_start}-{window_end} 第 {page + 1} / {total_pages} 页，"
+                        f"本页 {len(page_hits)} 条，新增 {inserted} 条，跳过 {skipped} 条，"
+                        f"当前 {current_count} / {TARGET_PROJECTS}"
+                    )
 
-                print(
-                    f"窗口 {window_start}-{window_end} 第 {page + 1} / {total_pages} 页，"
-                    f"本页 {len(page_hits)} 条，新增 {inserted} 条，跳过 {skipped} 条，"
-                    f"当前 {current_count} / {TARGET_PROJECTS}"
-                )
+                    if current_count >= TARGET_PROJECTS:
+                        break
 
-                if current_count >= TARGET_PROJECTS:
-                    break
-
-                if page + 1 < total_pages:
-                    time.sleep(REQUEST_INTERVAL)
+                    if page + 1 < total_pages:
+                        time.sleep(REQUEST_INTERVAL)
     finally:
-        session.close()
         conn.close()
 
     print(

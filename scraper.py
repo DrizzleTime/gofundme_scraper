@@ -1,18 +1,19 @@
+import argparse
+import asyncio
 import os
 import re
 import sqlite3
-import time
 from datetime import datetime
 from html import unescape
 from urllib.parse import urlparse
 
-import requests
+import httpx
 
 DB_NAME = "gofundme.db"
 IMAGE_DIR = "images"
 GRAPHQL_URL = "https://graphql.gofundme.com/graphql"
-REQUEST_INTERVAL = 0.3
 REQUEST_TIMEOUT = 30
+DEFAULT_CONCURRENCY = 5
 
 GRAPHQL_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -127,14 +128,30 @@ def extract_slug(url):
     return path.split("/")[-1]
 
 
-def fetch_fundraiser(session, slug):
+def parse_args():
+    parser = argparse.ArgumentParser(description="抓取 GoFundMe 项目详情")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"并发数，默认 {DEFAULT_CONCURRENCY}",
+    )
+    args = parser.parse_args()
+
+    if args.concurrency < 1:
+        parser.error("--concurrency 必须大于等于 1")
+
+    return args
+
+
+async def fetch_fundraiser(client, slug):
     payload = {
         "operationName": "GetFundraiser",
         "variables": {"slug": slug},
         "query": GRAPHQL_QUERY,
     }
 
-    response = session.post(
+    response = await client.post(
         GRAPHQL_URL,
         headers=GRAPHQL_HEADERS,
         json=payload,
@@ -222,8 +239,8 @@ def build_image_name(project_id, image_url, scrape_time):
     return f"{project_id}_{scrape_time}{extension}"
 
 
-def download_image(session, image_url, project_id, scrape_time):
-    response = session.get(image_url, timeout=REQUEST_TIMEOUT)
+async def download_image(client, image_url, project_id, scrape_time):
+    response = await client.get(image_url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
 
     image_name = build_image_name(project_id, image_url, scrape_time)
@@ -328,10 +345,68 @@ def save_project_snapshot(cursor, project_id, image_name, description, scrape_ti
     )
 
 
-def main():
+async def process_project(client, semaphore, row):
+    project_id, category, url, image_name, campaign_id = row
+    scrape_time = datetime.now().strftime("%Y%m%d%H%M%S")
+
+    try:
+        slug = extract_slug(url)
+        print(f"处理 {project_id}: {slug}")
+
+        async with semaphore:
+            fundraiser = await fetch_fundraiser(client, slug)
+            description_text = html_to_text(fundraiser.get("description"))
+
+            current_image_name = image_name
+            image_download_error = None
+            image_downloaded = False
+
+            if not current_image_name:
+                image_url = pick_image_url(fundraiser)
+                if image_url:
+                    try:
+                        current_image_name = await download_image(
+                            client,
+                            image_url,
+                            project_id,
+                            scrape_time,
+                        )
+                        image_downloaded = True
+                    except Exception as exc:
+                        image_download_error = f"图片下载失败: {exc}"
+                else:
+                    image_download_error = "未找到图片地址"
+
+            return {
+                "project_id": project_id,
+                "category": category,
+                "campaign_id": campaign_id,
+                "fundraiser": fundraiser,
+                "description_text": description_text,
+                "image_name": current_image_name,
+                "scrape_time": scrape_time,
+                "image_downloaded": image_downloaded,
+                "image_download_error": image_download_error,
+                "error": None,
+            }
+    except Exception as exc:
+        return {
+            "project_id": project_id,
+            "category": category,
+            "campaign_id": campaign_id,
+            "fundraiser": None,
+            "description_text": None,
+            "image_name": image_name,
+            "scrape_time": scrape_time,
+            "image_downloaded": False,
+            "image_download_error": None,
+            "error": str(exc),
+        }
+
+
+async def async_main(concurrency):
     os.makedirs(IMAGE_DIR, exist_ok=True)
 
-    session = requests.Session()
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
@@ -347,72 +422,71 @@ def main():
     failed_projects = 0
 
     try:
-        for project_id, category, url, image_name, campaign_id in pending_rows:
-            slug = extract_slug(url)
-            scrape_time = datetime.now().strftime("%Y%m%d%H%M%S")
+        semaphore = asyncio.Semaphore(concurrency)
+        limits = httpx.Limits(
+            max_connections=concurrency,
+            max_keepalive_connections=concurrency,
+        )
 
-            print(f"处理 {project_id}: {slug}")
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            limits=limits,
+        ) as client:
+            tasks = [
+                asyncio.create_task(process_project(client, semaphore, row))
+                for row in pending_rows
+            ]
 
-            try:
-                fundraiser = fetch_fundraiser(session, slug)
-                description_text = html_to_text(fundraiser.get("description"))
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                project_id = result["project_id"]
 
-                if campaign_id is None:
-                    insert_campaign(
-                        cursor,
-                        project_id,
-                        category,
-                        fundraiser,
-                        description_text,
-                    )
-                    inserted_campaigns += 1
-                else:
-                    update_campaign(
-                        cursor,
-                        project_id,
-                        category,
-                        fundraiser,
-                        description_text,
-                    )
-                    updated_campaigns += 1
+                if result["error"]:
+                    failed_projects += 1
+                    print(f"{project_id} 处理失败: {result['error']}")
+                    continue
 
-                current_image_name = image_name
-                if not current_image_name:
-                    image_url = pick_image_url(fundraiser)
-                    if image_url:
-                        try:
-                            current_image_name = download_image(
-                                session,
-                                image_url,
-                                project_id,
-                                scrape_time,
-                            )
-                            downloaded_images += 1
-                            print(f"  图片已下载: {current_image_name}")
-                        except Exception as exc:
-                            print(f"  图片下载失败: {exc}")
+                try:
+                    if result["campaign_id"] is None:
+                        insert_campaign(
+                            cursor,
+                            project_id,
+                            result["category"],
+                            result["fundraiser"],
+                            result["description_text"],
+                        )
+                        inserted_campaigns += 1
                     else:
-                        print("  未找到图片地址")
+                        update_campaign(
+                            cursor,
+                            project_id,
+                            result["category"],
+                            result["fundraiser"],
+                            result["description_text"],
+                        )
+                        updated_campaigns += 1
 
-                save_project_snapshot(
-                    cursor,
-                    project_id,
-                    current_image_name,
-                    description_text,
-                    scrape_time,
-                )
+                    if result["image_downloaded"]:
+                        downloaded_images += 1
+                        print(f"  图片已下载: {result['image_name']}")
+                    elif result["image_download_error"]:
+                        print(f"  {result['image_download_error']}")
 
-                conn.commit()
-                print("  已写入数据库")
+                    save_project_snapshot(
+                        cursor,
+                        project_id,
+                        result["image_name"],
+                        result["description_text"],
+                        result["scrape_time"],
+                    )
 
-            except Exception as exc:
-                failed_projects += 1
-                conn.rollback()
-                print(f"  处理失败: {exc}")
-
-            time.sleep(REQUEST_INTERVAL)
+                    conn.commit()
+                    print(f"  已写入数据库: {project_id}")
+                except Exception as exc:
+                    failed_projects += 1
+                    conn.rollback()
+                    print(f"{project_id} 写入失败: {exc}")
     finally:
-        session.close()
         conn.close()
 
     print(
@@ -425,4 +499,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    asyncio.run(async_main(args.concurrency))

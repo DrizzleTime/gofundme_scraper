@@ -1,13 +1,10 @@
 # 环境配置
 conda create -n gofundme python=3.10 -y
 source activate gofundme
-pip install pandas requests
-pip install selenium
+pip install pandas httpx
 pip install pyperclip
 pip install opencv-python
 pip install mediapipe==0.10.9
-sudo apt-get update
-sudo apt-get install xclip
 
 # db_init.py创建数据表，开始运行1次
 # python db_init.py
@@ -45,4 +42,3 @@ UPDATE projects SET content = NULL;
 # 删除表
 DROP TABLE projects;
 DROP TABLE campaigns;
-
