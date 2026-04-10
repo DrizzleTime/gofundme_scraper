@@ -13,7 +13,7 @@ DB_NAME = "gofundme.db"
 IMAGE_DIR = "images"
 GRAPHQL_URL = "https://graphql.gofundme.com/graphql"
 REQUEST_TIMEOUT = 30
-DEFAULT_CONCURRENCY = 5
+DEFAULT_CONCURRENCY = 10
 
 GRAPHQL_HEADERS = {
     "Accept": "application/json, text/plain, */*",
